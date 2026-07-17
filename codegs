@@ -1,0 +1,1597 @@
+/**
+ * Recruiter Dashboard
+ * 100% AI-generated, 100% human-directed.
+ * Directed and iterated by Yordhan Fitrians Akhmad B. based on real HR pain points —
+ * refined repeatedly for business fit, user experience, and workflow comfort.
+ * Published as a generic, reusable template. Configure everything via the ⚙️ Setup menu.
+ */
+
+// ============================================================
+// RECRUITER DASHBOARD — generic, reusable Google Apps Script template
+//
+// Paste into Extensions > Apps Script on a Google Sheet, then reload the
+// sheet and use the "⚙️ Setup" menu to configure everything. No secrets,
+// IDs, or company-specific values are hardcoded anywhere in this file.
+// ============================================================
+
+
+// ════════════════════════════════════════════════════════════
+// CONFIG LAYER (PropertiesService-backed)
+// ────────────────────────────────────────────────────────────
+// Every secret / ID / email / rate is stored in Script Properties and
+// entered by the user through the ⚙️ Setup menu. Code reads them at
+// runtime via getConfig_(). Nothing sensitive lives in source.
+// ════════════════════════════════════════════════════════════
+
+// Property keys used in PropertiesService.getScriptProperties().
+var PROP_KEYS = {
+  API_KEY: "API_KEY",                 // AI provider API key (kept out of source)
+  MODEL: "MODEL",                     // AI model string
+  ADMIN_EMAIL: "ADMIN_EMAIL",         // where audit/log copies go
+  EMAIL_DOMAIN: "EMAIL_DOMAIN",       // restrict quick-send recipients to this domain
+  CC_EMAILS: "CC_EMAILS",             // optional comma-separated CC list
+  PAY_RATE: "PAY_RATE",               // per-interview fee (number)
+  CURRENCY: "CURRENCY",               // currency prefix label, e.g. "$"
+  PROGRAM_START: "PROGRAM_START",     // ISO date; rows before this are treated as legacy
+  STAGE2_START: "STAGE2_START",       // ISO date; stage-2 counting starts here
+  SHEET_APPLICANTS: "SHEET_APPLICANTS",
+  SHEET_QUEUE: "SHEET_QUEUE",
+  SHEET_STAGE2: "SHEET_STAGE2",
+  SHEET_OFFERS: "SHEET_OFFERS",
+  SHEET_ROSTER: "SHEET_ROSTER",
+  SHEET_IMPORT: "SHEET_IMPORT",
+};
+
+// Safe generic defaults so the template runs before full configuration.
+var CONFIG_DEFAULTS = {
+  API_KEY: "",
+  MODEL: "",                          // e.g. a chat-completions model string; set via Setup
+  ADMIN_EMAIL: "user@example.com",
+  EMAIL_DOMAIN: "@example.com",
+  CC_EMAILS: "",
+  PAY_RATE: "10000",
+  CURRENCY: "$",
+  PROGRAM_START: "2020-01-01",
+  STAGE2_START: "2020-01-01",
+  SHEET_APPLICANTS: "Applicants",
+  SHEET_QUEUE: "Review Queue",
+  SHEET_STAGE2: "Stage 2 Interviews",
+  SHEET_OFFERS: "Offers",
+  SHEET_ROSTER: "Reviewers",
+  SHEET_IMPORT: "Imported Interviews",
+};
+
+function getConfig_() {
+  var props = PropertiesService.getScriptProperties();
+  var stored = props.getProperties();
+  var cfg = {};
+  Object.keys(CONFIG_DEFAULTS).forEach(function (k) {
+    cfg[k] = (stored[k] !== undefined && stored[k] !== "") ? stored[k] : CONFIG_DEFAULTS[k];
+  });
+  cfg.PAY_RATE = parseInt(cfg.PAY_RATE, 10) || 10000;
+  cfg.PROGRAM_START_DATE = parseISO_(cfg.PROGRAM_START);
+  cfg.STAGE2_START_DATE = parseISO_(cfg.STAGE2_START);
+  return cfg;
+}
+
+function saveConfig_(key, value) {
+  PropertiesService.getScriptProperties().setProperty(key, value);
+}
+
+function parseISO_(iso) {
+  var d = new Date(iso);
+  return isNaN(d.getTime()) ? new Date(2020, 0, 1) : d;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// EXAMPLE SHEET SCHEMA  ── ADAPT THIS TO YOUR OWN SPREADSHEET ──
+// ────────────────────────────────────────────────────────────
+// These are 1-based column positions on the main "Applicants" sheet.
+// Column offsets are structural, not secret, so they live in code — but
+// this layout is ONLY AN EXAMPLE. Whoever adopts this template must remap
+// these numbers (and the STATUS/ROLE string values below) to match their
+// real sheet. Header labels are intentionally generic.
+// ════════════════════════════════════════════════════════════
+var COLUMNS = {
+  TIMESTAMP: 1,       // A  - submission time
+  NAME: 2,            // B  - Candidate Name
+  RESPONSE: 3,        // C  - Stage-1 outcome (proceed / withdraw / legacy)
+  SOURCE: 4,          // D  - Channel / source label
+  REVIEWER: 5,        // E  - Stage-1 reviewer name
+  VERDICT: 6,         // F  - Screening verdict
+  CERT_FLAG: 22,      // V  - "has active certification" flag (example)
+  PHONE: 25,          // Y  - Contact number
+  ASSESS_DONE: 27,    // AA - Assessment attempted? (DONE / NO)
+  ASSESSMENT: 28,     // AB - Assessment result
+  SENT_STAGE2: 29,    // AC - Sent to stage-2 interview? (YES)
+  MGR_ATTEND: 32,     // AF - Stage-2 attendance marker
+  MGR_STATUS: 33,     // AG - Stage-2 (manager) verdict
+  TO_OFFERS: 34,      // AH - Copied to Offers? (Done)
+  OFFER_RESULT: 35,   // AI - Offer result (Accept / Reject)
+  OFFER_NOTES: 36,    // AJ - Offer notes
+};
+
+// Example status / label VALUES. Must match the literal strings in your sheet.
+// Replace freely; nothing here is required vocabulary.
+var STATUS = {
+  RESPONSE_PROCEED: "Yes - proceed to interview",
+  RESPONSE_LEGACY: "Processed before program start",
+  VERDICT_PASS_TOKEN: "passed",                 // substring match, case-insensitive
+  VERDICT_FAIL: ["FAILED: Screening", "FAILED: Over age limit", "FAILED: Already employed"],
+  ASSESS_NOT_DONE: "NO",
+  ASSESS_PASS: ["passed", "passed with warning"], // lowercase compare
+  SENT_YES: "YES",
+  STAGE2_PASS_TOKEN: "pass",                     // substring; excludes rows containing "not"
+  STAGE2_PASS_STATUSES: [
+    "1 - PASS, Priority",
+    "2 - PASS, Needs Training",
+    "3 - PASS, Can Wait",
+  ],
+  OFFER_ACCEPT: "Accept",
+  TO_OFFERS_DONE: "Done",
+};
+
+// Example role classification. Replace with your own neutral role labels.
+var ROLE = {
+  CERTIFIED: "Certified Role",
+  GENERAL_A: "General Role A",
+  GENERAL_B: "General Role B",
+  CERT_TOKEN: "active certification",  // substring in CERT_FLAG cell
+  CHANNEL_A_TOKEN: "channel a",        // substring in SOURCE cell -> GENERAL_A
+  CHANNEL_B_TOKEN: "channel b",        // substring in SOURCE cell -> GENERAL_B
+};
+
+
+// ════════════════════════════════════════════════════════════
+// MENUS
+// ════════════════════════════════════════════════════════════
+
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+
+  ui.createMenu("⚙️ Setup")
+    .addItem("Set AI API Key", "setupApiKey")
+    .addItem("Set AI Model", "setupModel")
+    .addItem("Set Admin Email & Domain", "setupEmails")
+    .addItem("Set CC Recipients (optional)", "setupCc")
+    .addItem("Set Pay Rate & Currency", "setupPay")
+    .addItem("Set Program Start Dates", "setupDates")
+    .addItem("Set Sheet Names", "setupSheetNames")
+    .addSeparator()
+    .addItem("View Current Config", "viewConfig")
+    .addItem("Clear All Config", "clearConfig")
+    .addToUi();
+
+  ui.createMenu("📊 Recruiter Dashboard")
+    .addItem("Open Dashboard", "openDashboard")
+    .addSeparator()
+    .addItem("Generate Pipeline Report", "generatePipelineReport")
+    .addItem("Interview Health Check-up", "interviewHealthCheckup")
+    .addSeparator()
+    .addItem("Scan: Pending Assessment", "scanPendingAssessment")
+    .addItem("Scan: Ready for Interview", "scanReadyForInterview")
+    .addItem("Scan: Ready for Offering", "scanReadyForOffering")
+    .addItem("Run All Scans", "runAllScans")
+    .addSeparator()
+    .addItem("Process: Stage 1 → Review Queue", "processStage1ToQueue")
+    .addItem("Process: Queue → Offers", "processQueueToOffers")
+    .addSeparator()
+    .addItem("Send Payroll Recap (Summary)", "sendPayrollRecap")
+    .addItem("Send Reviewer Report Cards", "sendReviewerReportCards")
+    .addItem("Send Stage-1 Follow-up Recap", "sendStage1FollowUpRecap")
+    .addSeparator()
+    .addItem("Manage Reviewer Roster", "setupRosterSheet_")
+    .addToUi();
+}
+
+
+// ── Setup prompts ───────────────────────────────────────────
+
+function setupApiKey() {
+  var ui = SpreadsheetApp.getUi();
+  var r = ui.prompt("Set AI API Key", "Paste your AI provider API key.\nStored in Script Properties, never in code.", ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  var v = r.getResponseText().trim();
+  if (v === "") { ui.alert("No change (empty)."); return; }
+  saveConfig_(PROP_KEYS.API_KEY, v);
+  ui.alert("API key saved.");
+}
+
+function setupModel() {
+  var ui = SpreadsheetApp.getUi();
+  var r = ui.prompt("Set AI Model", "Enter the model string for your AI provider's chat/completions endpoint.", ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  saveConfig_(PROP_KEYS.MODEL, r.getResponseText().trim());
+  ui.alert("Model saved.");
+}
+
+function setupEmails() {
+  var ui = SpreadsheetApp.getUi();
+  var a = ui.prompt("Admin Email", "Email that receives audit/log copies (e.g. user@example.com):", ui.ButtonSet.OK_CANCEL);
+  if (a.getSelectedButton() !== ui.Button.OK) return;
+  saveConfig_(PROP_KEYS.ADMIN_EMAIL, a.getResponseText().trim());
+  var d = ui.prompt("Email Domain", "Domain to restrict quick-send recipients (e.g. @example.com):", ui.ButtonSet.OK_CANCEL);
+  if (d.getSelectedButton() === ui.Button.OK) saveConfig_(PROP_KEYS.EMAIL_DOMAIN, d.getResponseText().trim());
+  ui.alert("Email settings saved.");
+}
+
+function setupCc() {
+  var ui = SpreadsheetApp.getUi();
+  var r = ui.prompt("CC Recipients", "Optional comma-separated CC list for outgoing recaps (leave blank for none):", ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  saveConfig_(PROP_KEYS.CC_EMAILS, r.getResponseText().trim());
+  ui.alert("CC list saved.");
+}
+
+function setupPay() {
+  var ui = SpreadsheetApp.getUi();
+  var p = ui.prompt("Pay Rate", "Per-interview fee as a plain number (e.g. 10000):", ui.ButtonSet.OK_CANCEL);
+  if (p.getSelectedButton() !== ui.Button.OK) return;
+  saveConfig_(PROP_KEYS.PAY_RATE, p.getResponseText().trim());
+  var c = ui.prompt("Currency Prefix", "Currency label to show before amounts (e.g. $):", ui.ButtonSet.OK_CANCEL);
+  if (c.getSelectedButton() === ui.Button.OK) saveConfig_(PROP_KEYS.CURRENCY, c.getResponseText().trim());
+  ui.alert("Pay settings saved.");
+}
+
+function setupDates() {
+  var ui = SpreadsheetApp.getUi();
+  var p = ui.prompt("Program Start Date", "ISO date (YYYY-MM-DD). Rows before this are treated as legacy:", ui.ButtonSet.OK_CANCEL);
+  if (p.getSelectedButton() !== ui.Button.OK) return;
+  saveConfig_(PROP_KEYS.PROGRAM_START, p.getResponseText().trim());
+  var s = ui.prompt("Stage-2 Start Date", "ISO date (YYYY-MM-DD). Stage-2 counting starts here:", ui.ButtonSet.OK_CANCEL);
+  if (s.getSelectedButton() === ui.Button.OK) saveConfig_(PROP_KEYS.STAGE2_START, s.getResponseText().trim());
+  ui.alert("Dates saved.");
+}
+
+function setupSheetNames() {
+  var ui = SpreadsheetApp.getUi();
+  var map = [
+    [PROP_KEYS.SHEET_APPLICANTS, "Main applicants sheet"],
+    [PROP_KEYS.SHEET_QUEUE, "Stage-2 review queue sheet"],
+    [PROP_KEYS.SHEET_STAGE2, "Stage-2 interviews sheet"],
+    [PROP_KEYS.SHEET_OFFERS, "Offers sheet"],
+    [PROP_KEYS.SHEET_ROSTER, "Reviewer roster sheet"],
+    [PROP_KEYS.SHEET_IMPORT, "Imported interviews sheet"],
+  ];
+  for (var i = 0; i < map.length; i++) {
+    var r = ui.prompt("Sheet Name", map[i][1] + " (current: " + getConfig_()[map[i][0]] + "):", ui.ButtonSet.OK_CANCEL);
+    if (r.getSelectedButton() !== ui.Button.OK) return;
+    var v = r.getResponseText().trim();
+    if (v !== "") saveConfig_(map[i][0], v);
+  }
+  ui.alert("Sheet names saved.");
+}
+
+function viewConfig() {
+  var cfg = getConfig_();
+  var masked = cfg.API_KEY ? (cfg.API_KEY.substring(0, 6) + "…(hidden)") : "(not set)";
+  var msg =
+    "AI API Key: " + masked + "\n" +
+    "AI Model: " + (cfg.MODEL || "(not set)") + "\n" +
+    "Admin Email: " + cfg.ADMIN_EMAIL + "\n" +
+    "Email Domain: " + cfg.EMAIL_DOMAIN + "\n" +
+    "CC: " + (cfg.CC_EMAILS || "(none)") + "\n" +
+    "Pay Rate: " + cfg.PAY_RATE + " " + cfg.CURRENCY + "\n" +
+    "Program Start: " + cfg.PROGRAM_START + "\n" +
+    "Stage-2 Start: " + cfg.STAGE2_START + "\n" +
+    "Sheets: " + cfg.SHEET_APPLICANTS + " / " + cfg.SHEET_QUEUE + " / " +
+    cfg.SHEET_STAGE2 + " / " + cfg.SHEET_OFFERS + " / " + cfg.SHEET_ROSTER + " / " + cfg.SHEET_IMPORT;
+  SpreadsheetApp.getUi().alert("Current Config", msg, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function clearConfig() {
+  var ui = SpreadsheetApp.getUi();
+  var c = ui.alert("Clear All Config", "Delete every stored property (API key, emails, sheet names)?", ui.ButtonSet.YES_NO);
+  if (c !== ui.Button.YES) return;
+  PropertiesService.getScriptProperties().deleteAllProperties();
+  ui.alert("Config cleared. Reconfigure via ⚙️ Setup.");
+}
+
+
+// ════════════════════════════════════════════════════════════
+// SHARED HELPERS
+// ════════════════════════════════════════════════════════════
+
+function getSheetData_(sheetName) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) return [];
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow < 2) return [];
+  return sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+}
+
+function findLastRowByColumn_(sheet, colIndex) {
+  var data = sheet.getRange(1, colIndex, sheet.getLastRow(), 1).getValues();
+  for (var i = data.length - 1; i >= 0; i--) {
+    if (String(data[i][0]).trim() !== "") return i + 1;
+  }
+  return 1;
+}
+
+function formatTimestamp_(value) {
+  if (!value) return "-";
+  try {
+    var date = new Date(value);
+    if (isNaN(date.getTime())) return String(value);
+    return Utilities.formatDate(date, Session.getScriptTimeZone(), "dd MMM yyyy, HH:mm");
+  } catch (e) {
+    return String(value);
+  }
+}
+
+function getCurrentTime_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd MMM yyyy, HH:mm");
+}
+
+function getCurrentDate_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd MMM yyyy");
+}
+
+function formatNumber_(num) {
+  return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function money_(cfg, num) {
+  return cfg.CURRENCY + " " + formatNumber_(num);
+}
+
+function sendEmailTo_(recipient, subject, htmlBody, cc) {
+  var opts = { htmlBody: htmlBody, name: "Recruiter Dashboard" };
+  if (cc) opts.cc = cc;
+  GmailApp.sendEmail(recipient, subject, "", opts);
+}
+
+function promptRecipientEmail_(reportName) {
+  var cfg = getConfig_();
+  var ui = SpreadsheetApp.getUi();
+  var result = ui.prompt("📧 " + reportName, "Send report to (name before " + cfg.EMAIL_DOMAIN + "):\n\nExample: user", ui.ButtonSet.OK_CANCEL);
+  if (result.getSelectedButton() !== ui.Button.OK) return null;
+
+  var input = result.getResponseText().trim().toLowerCase();
+  if (input === "") { ui.alert("Email cannot be empty."); return null; }
+
+  var name = input.replace(cfg.EMAIL_DOMAIN, "").replace("@", "");
+  if (name === "" || name.indexOf(" ") !== -1) { ui.alert("Invalid name. Type only the part before " + cfg.EMAIL_DOMAIN + "."); return null; }
+
+  var email = name + cfg.EMAIL_DOMAIN;
+  var confirm = ui.alert("Confirm", "Send \"" + reportName + "\" to " + email + "?", ui.ButtonSet.YES_NO);
+  return confirm === ui.Button.YES ? email : null;
+}
+
+function notifyAdmin_(reportName, recipientEmail) {
+  var cfg = getConfig_();
+  var requester = Session.getActiveUser().getEmail() || "Unknown user";
+  if (recipientEmail === cfg.ADMIN_EMAIL && requester === cfg.ADMIN_EMAIL) return;
+
+  var body = "<div style='font-family:Arial,sans-serif;font-size:14px;line-height:1.6;'>";
+  body += "<h3>Recruiter Dashboard — Report Log</h3><table style='border-collapse:collapse;'>";
+  body += "<tr><td style='padding:4px 12px 4px 0;font-weight:bold;'>Report:</td><td>" + reportName + "</td></tr>";
+  body += "<tr><td style='padding:4px 12px 4px 0;font-weight:bold;'>Requested by:</td><td>" + requester + "</td></tr>";
+  body += "<tr><td style='padding:4px 12px 4px 0;font-weight:bold;'>Sent to:</td><td>" + recipientEmail + "</td></tr>";
+  body += "<tr><td style='padding:4px 12px 4px 0;font-weight:bold;'>Time:</td><td>" + getCurrentTime_() + "</td></tr>";
+  body += "</table></div>";
+
+  GmailApp.sendEmail(cfg.ADMIN_EMAIL, "[Log] Recruiter Dashboard: \"" + reportName + "\" sent", "", { htmlBody: body, name: "Recruiter Dashboard" });
+}
+
+// Quote a sheet name for use inside an A1 spreadsheet formula.
+function q_(name) {
+  return "'" + String(name).replace(/'/g, "''") + "'";
+}
+
+// Case/space-insensitive normalization used for name matching.
+function norm_(s) {
+  return String(s).trim().toLowerCase().replace(/\s+/g, "");
+}
+
+
+// ════════════════════════════════════════════════════════════
+// PIPELINE REPORT
+// ════════════════════════════════════════════════════════════
+
+function emptyBucket_() {
+  return { applicant: 0, responded: 0, passedScreening: 0, assessDone: 0, assessPassed: 0, sentStage2: 0, stage2Passed: 0, offered: 0, accepted: 0 };
+}
+
+function computeBuckets_(cfg, data) {
+  var buckets = { roleGeneral: emptyBucket_(), roleCertified: emptyBucket_(), total: emptyBucket_(), channelA: emptyBucket_(), channelB: emptyBucket_() };
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var name = String(row[COLUMNS.NAME - 1]).trim();
+    if (name === "") continue;
+
+    var response = String(row[COLUMNS.RESPONSE - 1]).trim();
+    if (response === STATUS.RESPONSE_LEGACY) continue;
+
+    var certFlag = String(row[COLUMNS.CERT_FLAG - 1]).trim().toLowerCase();
+    var roleBucket = certFlag.indexOf(ROLE.CERT_TOKEN) !== -1 ? "roleCertified" : "roleGeneral";
+
+    var source = String(row[COLUMNS.SOURCE - 1]).trim().toLowerCase();
+    var channelBucket = source.indexOf(ROLE.CHANNEL_A_TOKEN) !== -1 ? "channelA" : "channelB";
+
+    var verdict = String(row[COLUMNS.VERDICT - 1]).trim();
+    var assessDone = String(row[COLUMNS.ASSESS_DONE - 1]).trim();
+    var assessResult = String(row[COLUMNS.ASSESSMENT - 1]).trim().toLowerCase();
+    var sentStage2 = String(row[COLUMNS.SENT_STAGE2 - 1]).trim();
+    var mgrStatus = String(row[COLUMNS.MGR_STATUS - 1]).trim().toLowerCase();
+    var toOffers = String(row[COLUMNS.TO_OFFERS - 1]).trim();
+    var offerResult = String(row[COLUMNS.OFFER_RESULT - 1]).trim();
+
+    var targets = [roleBucket, "total", channelBucket];
+
+    targets.forEach(function (b) { buckets[b].applicant++; });
+
+    var responded = response === STATUS.RESPONSE_PROCEED;
+    if (responded) targets.forEach(function (b) { buckets[b].responded++; });
+
+    var failedScreen = STATUS.VERDICT_FAIL.indexOf(verdict) !== -1;
+    var passedScreening = responded && !failedScreen;
+    if (passedScreening) targets.forEach(function (b) { buckets[b].passedScreening++; });
+
+    var assessDoneOk = passedScreening && assessDone === "DONE";
+    if (assessDoneOk) targets.forEach(function (b) { buckets[b].assessDone++; });
+
+    var assessPassedOk = assessDoneOk && STATUS.ASSESS_PASS.indexOf(assessResult) !== -1;
+    if (assessPassedOk) targets.forEach(function (b) { buckets[b].assessPassed++; });
+
+    var sentStage2Ok = assessPassedOk && sentStage2 === STATUS.SENT_YES;
+    if (sentStage2Ok) targets.forEach(function (b) { buckets[b].sentStage2++; });
+
+    var stage2PassedOk = sentStage2Ok && mgrStatus.indexOf(STATUS.STAGE2_PASS_TOKEN) !== -1 && mgrStatus.indexOf("not") === -1;
+    if (stage2PassedOk) targets.forEach(function (b) { buckets[b].stage2Passed++; });
+
+    var offeredOk = stage2PassedOk && toOffers === STATUS.TO_OFFERS_DONE;
+    if (offeredOk) targets.forEach(function (b) { buckets[b].offered++; });
+
+    var acceptedOk = offeredOk && offerResult === STATUS.OFFER_ACCEPT;
+    if (acceptedOk) targets.forEach(function (b) { buckets[b].accepted++; });
+  }
+  return buckets;
+}
+
+var STAGE_ORDER = [
+  { key: "applicant", label: "Applicant" },
+  { key: "responded", label: "Responded" },
+  { key: "passedScreening", label: "Passed Screening" },
+  { key: "assessDone", label: "Assessment Done" },
+  { key: "assessPassed", label: "Assessment Passed" },
+  { key: "sentStage2", label: "Sent to Stage 2" },
+  { key: "stage2Passed", label: "Stage 2 Passed" },
+  { key: "offered", label: "Offered" },
+  { key: "accepted", label: "Accepted" },
+];
+
+function generatePipelineReport() {
+  var cfg = getConfig_();
+  var reportName = "Pipeline Report";
+  var recipientEmail = promptRecipientEmail_(reportName);
+  if (!recipientEmail) return;
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var buckets = computeBuckets_(cfg, data);
+
+  var subject = "Recruiter Dashboard: Pipeline Report | " + getCurrentDate_();
+  var body = "<h2>Recruitment Pipeline Report</h2>";
+  body += "<p>Cumulative data as of " + getCurrentTime_() + " (excluding legacy rows before program start).</p>";
+
+  body += "<h2 style='margin-top:32px;border-bottom:2px solid #333;padding-bottom:4px;'>By Role</h2>";
+  body += buildHorizontalFunnel_([
+    { label: ROLE.GENERAL_A + " / " + ROLE.GENERAL_B, counts: buckets.roleGeneral, color: "#e3f0fc" },
+    { label: ROLE.CERTIFIED, counts: buckets.roleCertified, color: "#d4edda" },
+    { label: "TOTAL", counts: buckets.total, color: "#fff3cd" },
+  ]);
+
+  body += "<h2 style='margin-top:32px;border-bottom:2px solid #333;padding-bottom:4px;'>By Channel</h2>";
+  body += buildHorizontalFunnel_([
+    { label: "Channel A", counts: buckets.channelA, color: "#e8daef" },
+    { label: "Channel B", counts: buckets.channelB, color: "#fadbd8" },
+  ]);
+
+  body += generateAIInsight_(cfg, buckets);
+  body += "<br><p style='color:#888;font-size:12px;'>Generated at " + getCurrentTime_() + " | Sent to " + recipientEmail + "</p>";
+
+  sendEmailTo_(recipientEmail, subject, body);
+  notifyAdmin_(reportName, recipientEmail);
+  SpreadsheetApp.getUi().alert("Pipeline report sent to " + recipientEmail);
+}
+
+function buildHorizontalFunnel_(sections) {
+  var cell = "padding:6px 10px;border:1px solid #ddd;text-align:center;font-size:13px;";
+  var headerCell = cell + "background:#f5f5f5;font-weight:bold;white-space:nowrap;";
+  var labelCell = cell + "font-weight:bold;text-align:left;white-space:nowrap;";
+
+  var html = "<table style='border-collapse:collapse;font-family:Arial,sans-serif;margin-top:12px;'><tr><th style='" + headerCell + "'></th>";
+  STAGE_ORDER.forEach(function (s) { html += "<th style='" + headerCell + "'>" + s.label + "</th>"; });
+  html += "</tr>";
+
+  sections.forEach(function (section) {
+    var counts = section.counts;
+    html += "<tr><td style='" + labelCell + "background:" + section.color + ";' rowspan='3'>" + section.label + "</td>";
+    STAGE_ORDER.forEach(function (s) { html += "<td style='" + cell + "font-weight:bold;font-size:14px;'>" + (counts[s.key] || 0) + "</td>"; });
+    html += "</tr><tr>";
+    STAGE_ORDER.forEach(function (s, i) {
+      if (i === 0) { html += "<td style='" + cell + "color:#888;'>—</td>"; return; }
+      var prev = counts[STAGE_ORDER[i - 1].key] || 0, curr = counts[s.key] || 0;
+      var pct = prev === 0 ? "N/A" : ((curr / prev) * 100).toFixed(1) + "%";
+      html += "<td style='" + cell + "color:#27ae60;font-size:12px;'>↑ " + pct + "</td>";
+    });
+    html += "</tr><tr>";
+    STAGE_ORDER.forEach(function (s, i) {
+      if (i === 0) { html += "<td style='" + cell + "color:#888;'>—</td>"; return; }
+      var prev = counts[STAGE_ORDER[i - 1].key] || 0, curr = counts[s.key] || 0;
+      if (prev === 0) { html += "<td style='" + cell + "font-size:12px;'>N/A</td>"; return; }
+      var dropVal = ((prev - curr) / prev) * 100;
+      var color = "#888", weight = "normal";
+      if (dropVal > 50) { color = "#dc3545"; weight = "bold"; }
+      else if (dropVal > 30) { color = "#e67e22"; weight = "bold"; }
+      html += "<td style='" + cell + "color:" + color + ";font-weight:" + weight + ";font-size:12px;'>↓ " + dropVal.toFixed(1) + "%</td>";
+    });
+    html += "</tr><tr><td colspan='" + (STAGE_ORDER.length + 1) + "' style='border:none;height:8px;'></td></tr>";
+  });
+
+  html += "</table>";
+  return html;
+}
+
+
+// ── AI INSIGHT (generic chat-completions call) ──────────────
+// Uses the API key + model from Setup. Endpoint below is a placeholder;
+// point it at your own AI provider and adjust the request/response shape.
+
+function generateAIInsight_(cfg, buckets) {
+  if (!cfg.API_KEY || !cfg.MODEL) {
+    return "<br><p style='color:#999;font-style:italic;'>AI Insight skipped — API key or model not configured (see ⚙️ Setup).</p>";
+  }
+
+  var dataSummary = buildDataSummaryForAI_(buckets);
+  var prompt =
+    "You are an HR analytics advisor reviewing a generic recruitment pipeline.\n\n" +
+    dataSummary + "\n\n" +
+    "The pipeline is strictly linear (each stage requires all previous). It ends at " +
+    "Offer Accepted; do not speculate about any post-acceptance stage. Write exactly 3 " +
+    "plain-text executive insight points (1. 2. 3.), each 2-3 sentences, specific with " +
+    "numbers: (1) biggest bottleneck, (2) a comparison insight, (3) one actionable " +
+    "recommendation. No markdown, no filler.";
+
+  try {
+    // Placeholder endpoint — replace with your AI provider's URL and payload schema.
+    var options = {
+      method: "post",
+      contentType: "application/json",
+      headers: { "Authorization": "Bearer " + cfg.API_KEY },
+      payload: JSON.stringify({
+        model: cfg.MODEL,
+        max_tokens: 500,
+        messages: [{ role: "user", content: prompt }],
+      }),
+      muteHttpExceptions: true,
+    };
+    var response = UrlFetchApp.fetch("https://api.example.com/v1/chat/completions", options);
+    var status = response.getResponseCode();
+    if (status !== 200) {
+      return "<br><p style='color:#cc0000;font-style:italic;'>AI Insight error (" + status + ").</p>";
+    }
+    var result = JSON.parse(response.getContentText());
+    // Adjust this extraction to match your provider's response shape.
+    var insightText = (result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content)
+      ? result.choices[0].message.content
+      : (result.content && result.content[0] && result.content[0].text ? result.content[0].text : "");
+
+    var html = "<br><h2 style='margin-top:32px;border-bottom:2px solid #333;padding-bottom:4px;'>AI Executive Insight</h2>";
+    html += "<div style='background:#f0f4ff;border-left:4px solid #4a6cf7;padding:16px 20px;margin-top:12px;font-family:Arial,sans-serif;font-size:14px;line-height:1.7;white-space:pre-line;'>" + insightText + "</div>";
+    return html;
+  } catch (e) {
+    return "<br><p style='color:#cc0000;font-style:italic;'>AI Insight error: " + e.message + "</p>";
+  }
+}
+
+function buildDataSummaryForAI_(buckets) {
+  function formatBucket(name, counts) {
+    var text = name + ":\n";
+    for (var i = 0; i < STAGE_ORDER.length; i++) {
+      var s = STAGE_ORDER[i], count = counts[s.key] || 0, convStr = "";
+      if (i > 0) {
+        var prev = counts[STAGE_ORDER[i - 1].key] || 0;
+        var conv = prev === 0 ? "N/A" : ((count / prev) * 100).toFixed(1) + "%";
+        var drop = prev === 0 ? "N/A" : (((prev - count) / prev) * 100).toFixed(1) + "%";
+        convStr = " (conversion: " + conv + ", drop-off: " + drop + ")";
+      }
+      text += "  " + s.label + ": " + count + convStr + "\n";
+    }
+    return text;
+  }
+  var summary = "";
+  summary += formatBucket(ROLE.GENERAL_A + "/" + ROLE.GENERAL_B, buckets.roleGeneral);
+  summary += "\n" + formatBucket(ROLE.CERTIFIED, buckets.roleCertified);
+  summary += "\n" + formatBucket("TOTAL", buckets.total);
+  summary += "\n" + formatBucket("Channel A", buckets.channelA);
+  summary += "\n" + formatBucket("Channel B", buckets.channelB);
+  return summary;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// SCANS
+// ════════════════════════════════════════════════════════════
+
+function scanPendingAssessment() {
+  var cfg = getConfig_();
+  var reportName = "Pending Assessment";
+  var recipientEmail = promptRecipientEmail_(reportName);
+  if (!recipientEmail) return;
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var results = [];
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var verdict = String(row[COLUMNS.VERDICT - 1]).trim();
+    var assess = String(row[COLUMNS.ASSESSMENT - 1]).trim();
+    if (verdict.toLowerCase().indexOf(STATUS.VERDICT_PASS_TOKEN) !== -1 && assess === STATUS.ASSESS_NOT_DONE) {
+      results.push({
+        name: String(row[COLUMNS.NAME - 1]).trim(),
+        reviewer: String(row[COLUMNS.REVIEWER - 1]).trim(),
+        phone: String(row[COLUMNS.PHONE - 1]).trim(),
+        timestamp: formatTimestamp_(row[COLUMNS.TIMESTAMP - 1]),
+      });
+    }
+  }
+  if (results.length === 0) { SpreadsheetApp.getUi().alert("No candidates pending assessment."); return; }
+
+  var grouped = groupBy_(results, "reviewer");
+  var subject = "Recruiter Dashboard: Pending Assessment — " + results.length + " candidate(s) | " + getCurrentDate_();
+  var body = "<h2>Pending Assessment</h2><p>" + results.length + " candidate(s) passed screening but haven't completed the assessment.</p>";
+  body += buildGroupedTable_(grouped, "Reviewer", [
+    { header: "#", key: "_index" }, { header: "Candidate Name", key: "name" },
+    { header: "Contact", key: "phone" }, { header: "Reviewed Since", key: "timestamp" },
+  ]);
+  body += "<br><p style='color:#888;font-size:12px;'>Scanned at " + getCurrentTime_() + " | Sent to " + recipientEmail + "</p>";
+
+  sendEmailTo_(recipientEmail, subject, body);
+  notifyAdmin_(reportName, recipientEmail);
+  SpreadsheetApp.getUi().alert("Email sent: " + results.length + " candidate(s) pending assessment.");
+}
+
+function scanReadyForInterview() {
+  var cfg = getConfig_();
+  var reportName = "Ready for Interview";
+  var recipientEmail = promptRecipientEmail_(reportName);
+  if (!recipientEmail) return;
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var queueMap = buildQueueMap_(cfg);
+  var results = [];
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var verdict = String(row[COLUMNS.VERDICT - 1]).trim().toLowerCase();
+    var assess = String(row[COLUMNS.ASSESSMENT - 1]).trim().toLowerCase();
+    var mgrAttend = String(row[COLUMNS.MGR_ATTEND - 1]).trim();
+    var mgrStatus = String(row[COLUMNS.MGR_STATUS - 1]).trim();
+    var attendBlank = mgrAttend === "" || mgrAttend === "-";
+    var statusBlank = mgrStatus === "" || mgrStatus === "-";
+
+    if (verdict.indexOf(STATUS.VERDICT_PASS_TOKEN) !== -1 && STATUS.ASSESS_PASS.indexOf(assess) !== -1 && attendBlank && statusBlank) {
+      var candidateName = String(row[COLUMNS.NAME - 1]).trim();
+      var entry = queueMap[norm_(candidateName)];
+      if (entry && entry.processed === "Done") continue;
+      var assignedTo = (entry && entry.assignee !== "") ? entry.assignee : "⚠ Unassigned — needs attention";
+      results.push({
+        name: candidateName,
+        reviewer: String(row[COLUMNS.REVIEWER - 1]).trim(),
+        phone: String(row[COLUMNS.PHONE - 1]).trim(),
+        assessment: String(row[COLUMNS.ASSESSMENT - 1]).trim(),
+        assignedTo: assignedTo,
+      });
+    }
+  }
+  if (results.length === 0) { SpreadsheetApp.getUi().alert("No candidates ready for interview."); return; }
+
+  var grouped = groupBy_(results, "assignedTo");
+  var subject = "Recruiter Dashboard: Ready for Interview — " + results.length + " candidate(s) | " + getCurrentDate_();
+  var body = "<h2>Ready for Interview</h2><p>" + results.length + " candidate(s) passed screening & assessment, awaiting stage-2 interview.</p>";
+  body += buildGroupedTable_(grouped, "Assigned to", [
+    { header: "#", key: "_index" }, { header: "Candidate Name", key: "name" },
+    { header: "Contact", key: "phone" }, { header: "Reviewer", key: "reviewer" }, { header: "Assessment", key: "assessment" },
+  ]);
+  body += "<br><p style='color:#888;font-size:12px;'>Scanned at " + getCurrentTime_() + " | Sent to " + recipientEmail + "</p>";
+
+  sendEmailTo_(recipientEmail, subject, body);
+  notifyAdmin_(reportName, recipientEmail);
+  SpreadsheetApp.getUi().alert("Email sent: " + results.length + " candidate(s) ready for interview.");
+}
+
+function scanReadyForOffering() {
+  var cfg = getConfig_();
+  var reportName = "Ready for Offering";
+  var recipientEmail = promptRecipientEmail_(reportName);
+  if (!recipientEmail) return;
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var results = [];
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var mgrStatus = String(row[COLUMNS.MGR_STATUS - 1]).trim();
+    var offerResult = String(row[COLUMNS.OFFER_RESULT - 1]).trim();
+    var offerNotes = String(row[COLUMNS.OFFER_NOTES - 1]).trim();
+    var toOffers = String(row[COLUMNS.TO_OFFERS - 1]).trim();
+    if (STATUS.STAGE2_PASS_STATUSES.indexOf(mgrStatus) !== -1 && offerResult === "" && offerNotes === "") {
+      results.push({
+        name: String(row[COLUMNS.NAME - 1]).trim(),
+        reviewer: String(row[COLUMNS.REVIEWER - 1]).trim(),
+        phone: String(row[COLUMNS.PHONE - 1]).trim(),
+        status: mgrStatus,
+        notified: toOffers === "" ? "Not yet" : "Notified, no result",
+      });
+    }
+  }
+  if (results.length === 0) { SpreadsheetApp.getUi().alert("No candidates ready for offering."); return; }
+
+  var subject = "Recruiter Dashboard: Ready for Offering — " + results.length + " candidate(s) | " + getCurrentDate_();
+  var body = "<h2>Ready for Offering</h2><p>" + results.length + " candidate(s) passed stage-2 interview, ready to be offered.</p>";
+  body += buildTable_(results, [
+    { header: "#", key: "_index" }, { header: "Candidate Name", key: "name" }, { header: "Contact", key: "phone" },
+    { header: "Reviewer", key: "reviewer" }, { header: "Stage-2 Status", key: "status" }, { header: "Notified?", key: "notified" },
+  ]);
+  body += "<br><p style='color:#888;font-size:12px;'>Scanned at " + getCurrentTime_() + " | Sent to " + recipientEmail + "</p>";
+
+  sendEmailTo_(recipientEmail, subject, body);
+  notifyAdmin_(reportName, recipientEmail);
+  SpreadsheetApp.getUi().alert("Email sent: " + results.length + " candidate(s) ready for offering.");
+}
+
+function runAllScans() {
+  scanPendingAssessment();
+  scanReadyForInterview();
+  scanReadyForOffering();
+}
+
+
+// ── Table builders ──────────────────────────────────────────
+
+function groupBy_(rows, key) {
+  var grouped = {};
+  rows.forEach(function (r) { var k = r[key]; if (!grouped[k]) grouped[k] = []; grouped[k].push(r); });
+  return grouped;
+}
+
+function buildTable_(results, columns) {
+  var cellStyle = "padding:8px 12px;border:1px solid #ddd;text-align:left;";
+  var headerStyle = cellStyle + "background:#f5f5f5;font-weight:bold;";
+  var html = "<table style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;'><tr>";
+  columns.forEach(function (c) { html += "<th style='" + headerStyle + "'>" + c.header + "</th>"; });
+  html += "</tr>";
+  results.forEach(function (r, idx) {
+    html += "<tr style='background:" + (idx % 2 === 0 ? "#fff" : "#fafafa") + ";'>";
+    columns.forEach(function (c) { html += "<td style='" + cellStyle + "'>" + (c.key === "_index" ? idx + 1 : (r[c.key] || "")) + "</td>"; });
+    html += "</tr>";
+  });
+  return html + "</table>";
+}
+
+function buildGroupedTable_(grouped, groupLabel, columns) {
+  var cellStyle = "padding:8px 12px;border:1px solid #ddd;text-align:left;";
+  var headerStyle = cellStyle + "background:#f5f5f5;font-weight:bold;";
+  var html = "";
+  for (var group in grouped) {
+    if (!grouped.hasOwnProperty(group)) continue;
+    var candidates = grouped[group];
+    html += "<h3 style='margin-top:20px;'>" + groupLabel + ": " + group + " (" + candidates.length + ")</h3>";
+    html += "<table style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;'><tr>";
+    columns.forEach(function (c) { html += "<th style='" + headerStyle + "'>" + c.header + "</th>"; });
+    html += "</tr>";
+    candidates.forEach(function (r, idx) {
+      html += "<tr style='background:" + (idx % 2 === 0 ? "#fff" : "#fafafa") + ";'>";
+      columns.forEach(function (c) { html += "<td style='" + cellStyle + "'>" + (c.key === "_index" ? idx + 1 : (r[c.key] || "")) + "</td>"; });
+      html += "</tr>";
+    });
+    html += "</table>";
+  }
+  return html;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// INTERVIEW HEALTH CHECK-UP
+// ════════════════════════════════════════════════════════════
+
+function interviewHealthCheckup() {
+  var cfg = getConfig_();
+  var reportName = "Interview Health Check-up";
+  var recipientEmail = promptRecipientEmail_(reportName);
+  if (!recipientEmail) return;
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var weeks = buildWeekly_(cfg, data);
+  if (weeks.length === 0) { SpreadsheetApp.getUi().alert("No interview data since program start."); return; }
+
+  var currentWeekKey = weekKeyOf_(new Date());
+  var completedWeeks = weeks.filter(function (w, idx) { return w.key !== currentWeekKey && idx !== 0; });
+  var currentWeek = weeks.filter(function (w) { return w.key === currentWeekKey; })[0];
+  if (completedWeeks.length === 0) { SpreadsheetApp.getUi().alert("Need at least 2 completed weeks."); return; }
+
+  var bestWeek = completedWeeks[0], worstWeek = completedWeeks[0], totCand = 0, totInt = 0;
+  completedWeeks.forEach(function (w) {
+    if (w.candidates > bestWeek.candidates) bestWeek = w;
+    if (w.candidates < worstWeek.candidates) worstWeek = w;
+    totCand += w.candidates; totInt += w.reviewerCount;
+  });
+  var avgCand = totCand / completedWeeks.length;
+  var avgInt = totInt / completedWeeks.length;
+  var avgPer = avgInt > 0 ? avgCand / avgInt : 0;
+
+  var lastWeek = completedWeeks[completedWeeks.length - 1];
+  var lastAvgPer = lastWeek.reviewerCount > 0 ? lastWeek.candidates / lastWeek.reviewerCount : 0;
+  var health = classifyWeek_(lastWeek.candidates, lastWeek.reviewerCount, lastAvgPer);
+
+  var recommendation;
+  if (health.priority >= 3) {
+    recommendation = "Operations at normal-to-peak capacity: " + lastWeek.candidates + " candidates by " + lastWeek.reviewerCount + " active reviewer(s) last week. Maintain current roster.";
+  } else if (health.priority === 2) {
+    var need2 = Math.max(1, Math.ceil((150 - lastWeek.candidates) / 30));
+    recommendation = "Below normal capacity: only " + lastWeek.candidates + " candidates by " + lastWeek.reviewerCount + " reviewer(s). Add ~<strong>" + need2 + "</strong> active reviewer(s), or investigate underperformance.";
+  } else {
+    var need1 = Math.max(2, Math.ceil((150 - lastWeek.candidates) / 30));
+    recommendation = "Critical drop: only " + lastWeek.candidates + " candidates by " + lastWeek.reviewerCount + " reviewer(s). Add at least <strong>" + need1 + "</strong> reviewer(s), audit inactivity, and launch an urgent push.";
+  }
+
+  var subject = "Recruiter Dashboard: Interview Health Check-up | " + getCurrentDate_();
+  var body = "<h2>Interview Health Check-up</h2><p>Weekly analysis since program start. First week excluded as ramp-up.</p>";
+  body += "<div style='background:" + health.color + ";color:#fff;padding:16px 20px;margin-top:16px;border-radius:4px;font-family:Arial,sans-serif;'>";
+  body += "<h2 style='margin:0 0 8px 0;color:#fff;'>" + health.label.toUpperCase() + "</h2><p style='margin:0;font-size:14px;line-height:1.6;'>" + recommendation + "</p></div>";
+
+  var cell = "padding:8px 14px;border:1px solid #ddd;", labelCell = cell + "background:#f5f5f5;font-weight:bold;";
+  body += "<h3 style='margin-top:24px;'>Overview (excl. first & current week)</h3><table style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px;'>";
+  body += "<tr><td style='" + labelCell + "'>Completed Weeks</td><td style='" + cell + "'>" + completedWeeks.length + "</td></tr>";
+  body += "<tr><td style='" + labelCell + "'>Avg Candidates / Week</td><td style='" + cell + "'>" + avgCand.toFixed(1) + "</td></tr>";
+  body += "<tr><td style='" + labelCell + "'>Avg Reviewers / Week</td><td style='" + cell + "'>" + avgInt.toFixed(1) + "</td></tr>";
+  body += "<tr><td style='" + labelCell + "'>Avg Candidates / Reviewer</td><td style='" + cell + "'>" + avgPer.toFixed(1) + "</td></tr></table>";
+
+  body += "<h3 style='margin-top:24px;'>Best Week</h3>" + buildWeekCard_(bestWeek, "#d4edda");
+  body += "<h3 style='margin-top:24px;'>Worst Week</h3>" + buildWeekCard_(worstWeek, "#fadbd8");
+  body += "<h3 style='margin-top:24px;'>Last Completed Week</h3>" + buildWeekCard_(lastWeek, "#e3f0fc");
+  if (currentWeek) body += "<h3 style='margin-top:24px;'>Current Week (In Progress)</h3>" + buildWeekCard_(currentWeek, "#fff3cd");
+
+  body += "<br><p style='color:#888;font-size:12px;'>Generated at " + getCurrentTime_() + " | Sent to " + recipientEmail + "</p>";
+
+  sendEmailTo_(recipientEmail, subject, body);
+  notifyAdmin_(reportName, recipientEmail);
+  SpreadsheetApp.getUi().alert("Health Check-up sent to " + recipientEmail);
+}
+
+function buildWeekly_(cfg, data) {
+  var weekMap = {};
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    if (String(row[COLUMNS.NAME - 1]).trim() === "") continue;
+    var ts = row[COLUMNS.TIMESTAMP - 1];
+    if (!ts) continue;
+    var date = new Date(ts);
+    if (isNaN(date.getTime()) || date < cfg.PROGRAM_START_DATE) continue;
+    var reviewer = String(row[COLUMNS.REVIEWER - 1]).trim();
+    if (reviewer === "" || reviewer === "-") continue;
+
+    var key = weekKeyOf_(date);
+    if (!weekMap[key]) weekMap[key] = { start: weekStartOf_(date), candidates: 0, reviewers: {} };
+    weekMap[key].candidates++;
+    weekMap[key].reviewers[reviewer] = true;
+  }
+  return Object.keys(weekMap).sort().map(function (k) {
+    return { key: k, start: weekMap[k].start, candidates: weekMap[k].candidates,
+      reviewerCount: Object.keys(weekMap[k].reviewers).length, reviewers: Object.keys(weekMap[k].reviewers) };
+  });
+}
+
+function weekStartOf_(date) {
+  var dow = date.getDay(), fromMon = dow === 0 ? 6 : dow - 1;
+  var ws = new Date(date); ws.setDate(date.getDate() - fromMon); ws.setHours(0, 0, 0, 0);
+  return ws;
+}
+function weekKeyOf_(date) {
+  return Utilities.formatDate(weekStartOf_(date), Session.getScriptTimeZone(), "yyyy-MM-dd");
+}
+
+function classifyWeek_(c, ic, ap) {
+  if (c >= 200 && ic >= 6 && ap >= 40) return { label: "Very Healthy", color: "#27ae60", priority: 4 };
+  if (c >= 150 && ic >= 4 && ap >= 30) return { label: "Healthy", color: "#2ecc71", priority: 3 };
+  if (c >= 100 && ic >= 2 && ap >= 25) return { label: "At Risk", color: "#e67e22", priority: 2 };
+  return { label: "Heavy Risk", color: "#dc3545", priority: 1 };
+}
+
+function buildWeekCard_(week, bgColor) {
+  var label = Utilities.formatDate(week.start, Session.getScriptTimeZone(), "dd MMM yyyy");
+  var avgPer = week.reviewerCount > 0 ? (week.candidates / week.reviewerCount).toFixed(1) : "0";
+  var html = "<div style='background:" + bgColor + ";padding:12px 16px;margin-top:8px;border-left:4px solid #555;font-family:Arial,sans-serif;font-size:14px;'>";
+  html += "<strong>Week of " + label + "</strong><br>Candidates: <strong>" + week.candidates + "</strong><br>";
+  html += "Active reviewers: <strong>" + week.reviewerCount + "</strong> (" + week.reviewers.join(", ") + ")<br>Avg per reviewer: <strong>" + avgPer + "</strong></div>";
+  return html;
+}
+
+
+// ════════════════════════════════════════════════════════════
+// ROSTER MANAGEMENT
+// ════════════════════════════════════════════════════════════
+
+function setupRosterSheet_() {
+  var cfg = getConfig_();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(cfg.SHEET_ROSTER);
+  if (sheet) { sheet.activate(); return; }
+
+  sheet = ss.insertSheet(cfg.SHEET_ROSTER);
+  sheet.getRange(1, 1, 1, 4).setValues([["Name", "Email", "Stage", "Active"]]);
+  sheet.getRange(1, 1, 1, 4).setFontWeight("bold").setBackground("#f0f0f0");
+  sheet.setColumnWidth(1, 220); sheet.setColumnWidth(2, 240); sheet.setColumnWidth(3, 120); sheet.setColumnWidth(4, 80);
+  sheet.setFrozenRows(1); sheet.activate();
+
+  SpreadsheetApp.getUi().alert(
+    "Roster sheet created.\n\nFill in:\n" +
+    "A: Name (exact match to the reviewer name in your applicants sheet)\n" +
+    "B: Email (for sending reports)\n" +
+    "C: Stage (type 'Screening' or 'Interview')\n" +
+    "D: Active (type 'YES' or 'NO')\n\nOnly rows marked YES appear in the dashboard."
+  );
+}
+
+function getRoster_() {
+  var cfg = getConfig_();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(cfg.SHEET_ROSTER);
+  if (!sheet) return { screeningMap: {}, interviewMap: {} };
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { screeningMap: {}, interviewMap: {} };
+
+  var rows = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
+  var screeningMap = {}, interviewMap = {};
+  rows.forEach(function (row) {
+    var name = String(row[0]).trim(), email = String(row[1]).trim();
+    var stage = String(row[2]).trim().toLowerCase();
+    var active = String(row[3]).trim().toUpperCase() === "YES";
+    if (name === "" || !active) return;
+    var entry = { name: name, email: email, stage: stage };
+    if (stage === "screening") screeningMap[name] = entry;
+    else if (stage === "interview") interviewMap[name] = entry;
+  });
+  return { screeningMap: screeningMap, interviewMap: interviewMap };
+}
+
+
+// ════════════════════════════════════════════════════════════
+// PROCESSING: Stage 1 → Review Queue  (round-robin assignment)
+// ════════════════════════════════════════════════════════════
+//
+// The lookup formulas below use an EXAMPLE column layout on the applicants
+// sheet (contact in column Y, assessment in column AB). This is a
+// demonstration schema, not production. Whoever adapts this template must
+// remap the column letters to their own sheet.
+
+function buildQueueMap_(cfg) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var queueSheet = ss.getSheetByName(cfg.SHEET_QUEUE);
+  var map = {};
+  if (!queueSheet) return map;
+  var lastRow = findLastRowByColumn_(queueSheet, 1);
+  var rows = lastRow >= 2 ? queueSheet.getRange(2, 1, lastRow - 1, 8).getValues() : [];
+  rows.forEach(function (r) {
+    var n = norm_(r[0]);
+    if (n !== "") map[n] = { processed: String(r[5]).trim(), assignee: String(r[6]).trim() };
+  });
+  return map;
+}
+
+function processStage1ToQueue() {
+  var cfg = getConfig_();
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var queueSheet = ss.getSheetByName(cfg.SHEET_QUEUE);
+  if (!queueSheet) { ui.alert("Sheet '" + cfg.SHEET_QUEUE + "' not found."); return; }
+
+  var queueMap = buildQueueMap_(cfg);
+  var unassigned = [];
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var verdict = String(row[COLUMNS.VERDICT - 1]).trim().toLowerCase();
+    var assess = String(row[COLUMNS.ASSESSMENT - 1]).trim().toLowerCase();
+    var mgrAttend = String(row[COLUMNS.MGR_ATTEND - 1]).trim();
+    var mgrStatus = String(row[COLUMNS.MGR_STATUS - 1]).trim();
+    var attendBlank = mgrAttend === "" || mgrAttend === "-";
+    var statusBlank = mgrStatus === "" || mgrStatus === "-";
+    if (verdict.indexOf(STATUS.VERDICT_PASS_TOKEN) !== -1 && STATUS.ASSESS_PASS.indexOf(assess) !== -1 && attendBlank && statusBlank) {
+      var name = String(row[COLUMNS.NAME - 1]).trim();
+      if (queueMap[norm_(name)]) continue;
+      unassigned.push(name);
+    }
+  }
+  if (unassigned.length === 0) { ui.alert("No unassigned candidates. All already in the review queue."); return; }
+
+  var roster = getRoster_();
+  var interviewers = Object.keys(roster.interviewMap);
+  if (interviewers.length === 0) { ui.alert("No active interviewers in the roster (Stage='Interview', Active='YES')."); return; }
+
+  // Current backlog per interviewer (Not Yet in queue).
+  var lastRow = findLastRowByColumn_(queueSheet, 1);
+  var queueRows = lastRow >= 2 ? queueSheet.getRange(2, 1, lastRow - 1, 8).getValues() : [];
+  var backlog = {};
+  interviewers.forEach(function (n) { backlog[n] = 0; });
+  queueRows.forEach(function (r) {
+    var assignee = String(r[6]).trim(), processed = String(r[5]).trim();
+    if (assignee in backlog && processed === "Not Yet") backlog[assignee]++;
+  });
+
+  var assignments = [];
+  unassigned.forEach(function (candidate) {
+    var minInt = interviewers[0], minCount = backlog[minInt];
+    for (var f = 1; f < interviewers.length; f++) {
+      if (backlog[interviewers[f]] < minCount) { minCount = backlog[interviewers[f]]; minInt = interviewers[f]; }
+    }
+    assignments.push({ name: candidate, interviewer: minInt });
+    backlog[minInt]++;
+  });
+
+  var summary = {};
+  assignments.forEach(function (a) { summary[a.interviewer] = (summary[a.interviewer] || 0) + 1; });
+  var preview = "Found " + unassigned.length + " unassigned candidate(s).\n\nAssignment preview:\n";
+  Object.keys(summary).forEach(function (k) { preview += "  " + k + ": " + summary[k] + "\n"; });
+  preview += "\nWrite " + unassigned.length + " row(s) to '" + cfg.SHEET_QUEUE + "'?";
+  if (ui.alert("Process: Stage 1 → Review Queue", preview, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+  var startRow = lastRow + 1;
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd MMM yyyy");
+  var A = q_(cfg.SHEET_APPLICANTS), IMP = q_(cfg.SHEET_IMPORT), S2 = q_(cfg.SHEET_STAGE2);
+
+  for (var a = 0; a < assignments.length; a++) {
+    var rowNum = startRow + a, cand = assignments[a].name, intName = assignments[a].interviewer;
+    queueSheet.getRange(rowNum, 1).setValue(cand);
+    // Column D: contact lookup (EXAMPLE: applicants column Y).
+    queueSheet.getRange(rowNum, 4).setFormula(
+      "=IFERROR(ARRAYFORMULA(INDEX(" + A + "!Y:Y,MATCH(1,(SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(A" + rowNum + ")),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + A + "!B:B)),CHAR(160),\"\"),\" \",\"\"))*1,0))),\"\")");
+    // Column E: assessment lookup (EXAMPLE: applicants column AB).
+    queueSheet.getRange(rowNum, 5).setFormula(
+      "=IFERROR(ARRAYFORMULA(INDEX(" + A + "!AB:AB,MATCH(1,(SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(A" + rowNum + ")),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + A + "!B:B)),CHAR(160),\"\"),\" \",\"\"))*1,0))),\"\")");
+    // Column F: Done/Not Yet based on presence in import or stage-2 sheet.
+    queueSheet.getRange(rowNum, 6).setFormula(
+      "=IF(A" + rowNum + "=\"\",\"\",IF(SUMPRODUCT((SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + IMP + "!A:A)),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(A" + rowNum + ")),CHAR(160),\"\"),\" \",\"\"))*1)>=1,\"Done\",IF(SUMPRODUCT((SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + S2 + "!C:C)),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(A" + rowNum + ")),CHAR(160),\"\"),\" \",\"\"))*1)>=1,\"Done\",\"Not Yet\")))");
+    queueSheet.getRange(rowNum, 7).setValue(intName);
+    queueSheet.getRange(rowNum, 8).setFormula("=IF(F" + rowNum + "=\"Not Yet\",FALSE,TRUE)");
+    queueSheet.getRange(rowNum, 9).setValue(today);
+  }
+  SpreadsheetApp.flush();
+
+  notifyAdmin_("Process: Stage 1 → Review Queue", cfg.ADMIN_EMAIL);
+  ui.alert("Done. " + assignments.length + " candidate(s) added to '" + cfg.SHEET_QUEUE + "'.");
+}
+
+
+// ════════════════════════════════════════════════════════════
+// PROCESSING: Review Queue / Passed → Offers
+// ════════════════════════════════════════════════════════════
+
+function processQueueToOffers() {
+  var cfg = getConfig_();
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var offersSheet = ss.getSheetByName(cfg.SHEET_OFFERS);
+  if (!offersSheet) { ui.alert("Sheet '" + cfg.SHEET_OFFERS + "' not found."); return; }
+
+  var offersLastRow = findLastRowByColumn_(offersSheet, 2);
+  var offersData = offersLastRow >= 2 ? offersSheet.getRange(2, 1, offersLastRow - 1, 6).getValues() : [];
+  var offersMap = {};
+  offersData.forEach(function (r) { var n = norm_(r[1]); if (n !== "") offersMap[n] = true; });
+
+  var unassigned = [];
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var mgrStatus = String(row[COLUMNS.MGR_STATUS - 1]).trim();
+    var offerResult = String(row[COLUMNS.OFFER_RESULT - 1]).trim();
+    var offerNotes = String(row[COLUMNS.OFFER_NOTES - 1]).trim();
+    if (STATUS.STAGE2_PASS_STATUSES.indexOf(mgrStatus) !== -1 && offerResult === "" && offerNotes === "") {
+      var name = String(row[COLUMNS.NAME - 1]).trim();
+      if (offersMap[norm_(name)]) continue;
+      unassigned.push(name);
+    }
+  }
+  if (unassigned.length === 0) { ui.alert("No new candidates. All eligible are already in Offers."); return; }
+
+  var preview = "Found " + unassigned.length + " candidate(s) not yet in Offers:\n\n";
+  unassigned.forEach(function (n, i) { if (i < 20) preview += (i + 1) + ". " + n + "\n"; });
+  if (unassigned.length > 20) preview += "... and " + (unassigned.length - 20) + " more\n";
+  preview += "\nWrite " + unassigned.length + " row(s) to '" + cfg.SHEET_OFFERS + "'?";
+  if (ui.alert("Process: Queue → Offers", preview, ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+
+  var startRow = offersLastRow + 1;
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd-MMM-yyyy");
+  var A = q_(cfg.SHEET_APPLICANTS);
+
+  for (var a = 0; a < unassigned.length; a++) {
+    var rowNum = startRow + a, cand = unassigned[a];
+    offersSheet.getRange(rowNum, 1).setValue(today);
+    offersSheet.getRange(rowNum, 2).setValue(cand);
+    // Column C: certification flag lookup (EXAMPLE: applicants column V).
+    offersSheet.getRange(rowNum, 3).setFormula(
+      "=IFERROR(ARRAYFORMULA(INDEX(" + A + "!V:V,MATCH(1,(SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(B" + rowNum + ")),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + A + "!B:B)),CHAR(160),\"\"),\" \",\"\"))*1,0))),\"\")");
+    // Column D: role classification from cert flag + channel (EXAMPLE schema).
+    offersSheet.getRange(rowNum, 4).setFormula(
+      "=IF(B" + rowNum + "=\"\",\"\",IFERROR(IF(ISNUMBER(SEARCH(\"" + ROLE.CERT_TOKEN + "\",C" + rowNum + ")),\"" + ROLE.CERTIFIED + "\",IF(ISNUMBER(SEARCH(\"" + ROLE.CHANNEL_A_TOKEN + "\",ARRAYFORMULA(INDEX(" + A + "!D:D,MATCH(1,(SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(B" + rowNum + ")),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + A + "!B:B)),CHAR(160),\"\"),\" \",\"\"))*1,0))))),\"" + ROLE.GENERAL_A + "\",\"" + ROLE.GENERAL_B + "\")),\"" + ROLE.GENERAL_B + "\"))");
+    // Column E: age/attribute lookup (EXAMPLE: applicants column H).
+    offersSheet.getRange(rowNum, 5).setFormula(
+      "=IFERROR(ARRAYFORMULA(INDEX(" + A + "!H:H,MATCH(1,(SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(B" + rowNum + ")),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + A + "!B:B)),CHAR(160),\"\"),\" \",\"\"))*1,0))),\"\")");
+    // Column F: contact lookup (EXAMPLE: applicants column Y).
+    offersSheet.getRange(rowNum, 6).setFormula(
+      "=IFERROR(ARRAYFORMULA(INDEX(" + A + "!Y:Y,MATCH(1,(SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(B" + rowNum + ")),CHAR(160),\"\"),\" \",\"\")=SUBSTITUTE(SUBSTITUTE(LOWER(TRIM(" + A + "!B:B)),CHAR(160),\"\"),\" \",\"\"))*1,0))),\"\")");
+  }
+  SpreadsheetApp.flush();
+
+  notifyAdmin_("Process: Queue → Offers", cfg.ADMIN_EMAIL);
+  ui.alert("Done. " + unassigned.length + " candidate(s) added to '" + cfg.SHEET_OFFERS + "'.");
+}
+
+
+// ════════════════════════════════════════════════════════════
+// PAYROLL RECAP (summary for a pay period)
+// ════════════════════════════════════════════════════════════
+
+function payPeriodFromPrompt_(ui) {
+  var r = ui.prompt("Payroll Period", "Enter disbursement month as MM YYYY.\nExample: 04 2026 (period 21 Mar – 20 Apr).", ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return null;
+  var parts = r.getResponseText().trim().split(/\s+/);
+  if (parts.length !== 2) { ui.alert("Invalid format. Use: MM YYYY"); return null; }
+  var m = parseInt(parts[0], 10), y = parseInt(parts[1], 10);
+  if (isNaN(m) || isNaN(y) || m < 1 || m > 12) { ui.alert("Invalid month/year."); return null; }
+  return {
+    start: new Date(y, m - 2, 21, 0, 0, 0),
+    end: new Date(y, m - 1, 20, 23, 59, 59),
+    label: Utilities.formatDate(new Date(y, m - 1, 1), Session.getScriptTimeZone(), "MMMM yyyy"),
+  };
+}
+
+function sendPayrollRecap() {
+  var cfg = getConfig_();
+  var ui = SpreadsheetApp.getUi();
+  var period = payPeriodFromPrompt_(ui);
+  if (!period) return;
+  var cutoffLabel = Utilities.formatDate(period.start, Session.getScriptTimeZone(), "dd MMM yyyy") + " – " + Utilities.formatDate(period.end, Session.getScriptTimeZone(), "dd MMM yyyy");
+
+  var recipientEmail = promptRecipientEmail_("Payroll Recap");
+  if (!recipientEmail) return;
+
+  var roster = getRoster_();
+  var screeners = Object.keys(roster.screeningMap);
+  var interviewers = Object.keys(roster.interviewMap);
+
+  var applicants = getSheetData_(cfg.SHEET_APPLICANTS);
+  var scStats = {};
+  screeners.forEach(function (n) { scStats[n] = { submitted: 0, interviewed: 0, passed: 0, failed: 0 }; });
+  for (var i = 0; i < applicants.length; i++) {
+    var row = applicants[i];
+    var reviewer = String(row[COLUMNS.REVIEWER - 1]).trim();
+    if (!(reviewer in scStats)) continue;
+    var ts = row[COLUMNS.TIMESTAMP - 1]; if (!ts) continue;
+    var d = new Date(ts); if (isNaN(d.getTime()) || d < period.start || d > period.end) continue;
+    var status = String(row[COLUMNS.RESPONSE - 1]).trim();
+    var verdict = String(row[COLUMNS.VERDICT - 1]).trim().toLowerCase();
+    scStats[reviewer].submitted++;
+    if (status === STATUS.RESPONSE_PROCEED) {
+      scStats[reviewer].interviewed++;
+      if (verdict.indexOf(STATUS.VERDICT_PASS_TOKEN) !== -1) scStats[reviewer].passed++; else scStats[reviewer].failed++;
+    }
+  }
+
+  var stage2 = getSheetData_(cfg.SHEET_STAGE2);
+  var intStats = {};
+  interviewers.forEach(function (n) { intStats[n] = { interviewed: 0 }; });
+  for (var j = 0; j < stage2.length; j++) {
+    var r2 = stage2[j];
+    var interviewer = String(r2[1]).trim();       // EXAMPLE: stage-2 column B = interviewer
+    if (!(interviewer in intStats)) continue;
+    var ts2 = r2[0]; if (!ts2) continue;          // EXAMPLE: stage-2 column A = timestamp
+    var d2 = new Date(ts2); if (isNaN(d2.getTime()) || d2 < cfg.STAGE2_START_DATE || d2 < period.start || d2 > period.end) continue;
+    intStats[interviewer].interviewed++;
+  }
+
+  var totalScreenerPay = 0, totalInterviewerPay = 0;
+  var scEntries = screeners.map(function (n) {
+    var s = scStats[n], pay = s.interviewed * cfg.PAY_RATE; totalScreenerPay += pay;
+    return { name: n, submitted: s.submitted, interviewed: s.interviewed, passed: s.passed, failed: s.failed,
+      pct: s.submitted > 0 ? ((s.interviewed / s.submitted) * 100).toFixed(1) : "0.0", pay: pay };
+  }).sort(function (a, b) { return b.interviewed - a.interviewed; });
+
+  var intEntries = interviewers.map(function (n) {
+    var s = intStats[n], pay = s.interviewed * cfg.PAY_RATE; totalInterviewerPay += pay;
+    return { name: n, interviewed: s.interviewed, pay: pay };
+  }).sort(function (a, b) { return b.interviewed - a.interviewed; });
+
+  var grandTotal = totalScreenerPay + totalInterviewerPay;
+  var activeSc = scEntries.filter(function (e) { return e.interviewed > 0; });
+  var inactiveSc = scEntries.filter(function (e) { return e.interviewed === 0; });
+
+  var cell = "padding:8px 12px;border:1px solid #ddd;text-align:left;font-size:13px;";
+  var headerCell = cell + "background:#f5f5f5;font-weight:bold;";
+  var numCell = cell + "text-align:center;";
+
+  var body = "<div style='font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#333;'>";
+  body += "<h2 style='color:#2c3e50;'>Payroll Recap — " + period.label + "</h2>";
+  body += "<p><strong>Period:</strong> " + cutoffLabel + "<br><strong>Rate:</strong> " + money_(cfg, cfg.PAY_RATE) + " / interview</p>";
+
+  body += "<div style='background:#2c3e50;color:#fff;padding:20px 24px;border-radius:4px;margin:20px 0;'>";
+  body += "<div style='font-size:13px;opacity:0.8;'>Total Disbursement</div><div style='font-size:28px;font-weight:bold;margin-top:4px;'>" + money_(cfg, grandTotal) + "</div>";
+  body += "<div style='margin-top:12px;display:flex;gap:24px;'>";
+  body += "<div><div style='font-size:11px;opacity:0.7;'>Screening</div><div style='font-size:16px;font-weight:bold;'>" + money_(cfg, totalScreenerPay) + "</div></div>";
+  body += "<div><div style='font-size:11px;opacity:0.7;'>Interview</div><div style='font-size:16px;font-weight:bold;'>" + money_(cfg, totalInterviewerPay) + "</div></div>";
+  body += "</div></div>";
+
+  var top3 = activeSc.slice(0, 3);
+  if (top3.length > 0) {
+    body += "<div style='background:#d4edda;padding:14px 18px;border-left:4px solid #27ae60;margin:8px 0;border-radius:4px;'><strong style='color:#155724;'>Top Screeners</strong><br>";
+    top3.forEach(function (e, i) { body += (i + 1) + ". <strong>" + e.name + "</strong> — " + e.interviewed + " (" + money_(cfg, e.pay) + ")<br>"; });
+    body += "</div>";
+  }
+  if (inactiveSc.length > 0) {
+    body += "<div style='background:#f8d7da;padding:14px 18px;border-left:4px solid #dc3545;margin:8px 0;border-radius:4px;'><strong style='color:#721c24;'>Inactive Screeners (0)</strong><br>" + inactiveSc.map(function (e) { return e.name; }).join(", ") + "</div>";
+  }
+
+  body += "<h3 style='margin-top:28px;color:#2c3e50;'>Screening Stage</h3><table style='border-collapse:collapse;width:100%;'>";
+  body += "<tr><th style='" + headerCell + "'>#</th><th style='" + headerCell + "'>Name</th><th style='" + headerCell + "'>Submitted</th><th style='" + headerCell + "'>Interviewed</th><th style='" + headerCell + "'>%</th><th style='" + headerCell + "'>Passed</th><th style='" + headerCell + "'>Failed</th><th style='" + headerCell + "'>Pay</th></tr>";
+  scEntries.forEach(function (e, i) {
+    var dim = e.interviewed === 0 ? "color:#ccc;" : "";
+    body += "<tr style='background:" + (i % 2 === 0 ? "#fff" : "#fafafa") + ";" + dim + "'><td style='" + numCell + "'>" + (i + 1) + "</td><td style='" + cell + "'><strong>" + e.name + "</strong></td><td style='" + numCell + "'>" + e.submitted + "</td><td style='" + numCell + "font-weight:bold;'>" + e.interviewed + "</td><td style='" + numCell + "'>" + e.pct + "%</td><td style='" + numCell + "color:#27ae60;'>" + e.passed + "</td><td style='" + numCell + "color:#dc3545;'>" + e.failed + "</td><td style='" + cell + "font-weight:bold;'>" + money_(cfg, e.pay) + "</td></tr>";
+  });
+  body += "</table>";
+
+  body += "<h3 style='margin-top:28px;color:#2c3e50;'>Interview Stage</h3><table style='border-collapse:collapse;width:100%;'>";
+  body += "<tr><th style='" + headerCell + "'>#</th><th style='" + headerCell + "'>Name</th><th style='" + headerCell + "'>Interviews</th><th style='" + headerCell + "'>Pay</th></tr>";
+  intEntries.forEach(function (e, i) {
+    var dim = e.interviewed === 0 ? "color:#ccc;" : "";
+    body += "<tr style='background:" + (i % 2 === 0 ? "#fff" : "#fafafa") + ";" + dim + "'><td style='" + numCell + "'>" + (i + 1) + "</td><td style='" + cell + "'><strong>" + e.name + "</strong></td><td style='" + numCell + "font-weight:bold;'>" + e.interviewed + "</td><td style='" + cell + "font-weight:bold;'>" + money_(cfg, e.pay) + "</td></tr>";
+  });
+  body += "</table>";
+
+  body += "<br><p style='color:#888;font-size:12px;'>Generated at " + getCurrentTime_() + " | Sent to " + recipientEmail + "</p></div>";
+
+  sendEmailTo_(recipientEmail, "Recruiter Dashboard: Payroll Recap — " + period.label + " | " + getCurrentDate_(), body);
+  notifyAdmin_("Payroll Recap — " + period.label, recipientEmail);
+  ui.alert("Payroll Recap for " + period.label + " sent to " + recipientEmail + ".\nTotal: " + money_(cfg, grandTotal));
+}
+
+
+// ════════════════════════════════════════════════════════════
+// INDIVIDUAL REVIEWER REPORT CARDS  (screening stage)
+// ════════════════════════════════════════════════════════════
+
+function sendReviewerReportCards() {
+  var cfg = getConfig_();
+  var ui = SpreadsheetApp.getUi();
+
+  var roster = getRoster_();
+  var screeners = Object.keys(roster.screeningMap);
+  if (screeners.length === 0) { ui.alert("No active screening reviewers in the roster."); return; }
+
+  var list = "";
+  screeners.forEach(function (f, i) { list += (i + 1) + ". " + f + "\n"; });
+  var sel = ui.prompt("Select Reviewers", "Numbers separated by commas, or 'all':\n\n" + list, ui.ButtonSet.OK_CANCEL);
+  if (sel.getSelectedButton() !== ui.Button.OK) return;
+  var input = sel.getResponseText().trim().toLowerCase();
+  var selected = [];
+  if (input === "all") selected = screeners;
+  else input.split(",").forEach(function (t) { var idx = parseInt(t.trim(), 10); if (!isNaN(idx) && idx >= 1 && idx <= screeners.length) selected.push(screeners[idx - 1]); });
+  if (selected.length === 0) { ui.alert("Invalid selection."); return; }
+
+  var period = payPeriodFromPrompt_(ui);
+  if (!period) return;
+  var cutoffLabel = Utilities.formatDate(period.start, Session.getScriptTimeZone(), "dd MMM yyyy") + " – " + Utilities.formatDate(period.end, Session.getScriptTimeZone(), "dd MMM yyyy");
+
+  var mode = ui.prompt("Recipient", "Type a full email to test (e.g. user@example.com), or 'send' to email each reviewer's registered address.", ui.ButtonSet.OK_CANCEL);
+  if (mode.getSelectedButton() !== ui.Button.OK) return;
+  var modeInput = mode.getResponseText().trim();
+  var sendReal = modeInput.toLowerCase() === "send";
+  var testEmail = sendReal ? "" : modeInput;
+  if (!sendReal && (testEmail === "" || testEmail.indexOf("@") === -1)) { ui.alert("Invalid email."); return; }
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var cc = cfg.CC_EMAILS || null;
+  var sent = 0, results = [];
+
+  selected.forEach(function (reviewerName) {
+    var submitted = 0, interviewed = 0, passed = 0, failed = 0, detail = [];
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i];
+      if (String(row[COLUMNS.REVIEWER - 1]).trim() !== reviewerName) continue;
+      var ts = row[COLUMNS.TIMESTAMP - 1]; if (!ts) continue;
+      var d = new Date(ts); if (isNaN(d.getTime()) || d < period.start || d > period.end) continue;
+      submitted++;
+      if (String(row[COLUMNS.RESPONSE - 1]).trim() === STATUS.RESPONSE_PROCEED) {
+        interviewed++;
+        if (String(row[COLUMNS.VERDICT - 1]).trim().toLowerCase().indexOf(STATUS.VERDICT_PASS_TOKEN) !== -1) passed++; else failed++;
+        detail.push({ date: Utilities.formatDate(d, Session.getScriptTimeZone(), "dd MMM yyyy, HH:mm"), sort: d.getTime(),
+          name: String(row[COLUMNS.NAME - 1]).trim(), phone: String(row[COLUMNS.PHONE - 1]).trim() });
+      }
+    }
+    detail.sort(function (a, b) { return a.sort - b.sort; });
+    var pct = submitted > 0 ? ((interviewed / submitted) * 100).toFixed(1) : "0.0";
+    var fee = interviewed * cfg.PAY_RATE;
+
+    var recipient = sendReal ? (roster.screeningMap[reviewerName].email || "") : testEmail;
+    if (recipient === "" || recipient.indexOf("@") === -1) { results.push({ name: reviewerName, status: "Skipped — no email" }); return; }
+
+    var isTest = !sendReal;
+    var cell = "padding:8px 12px;border:1px solid #ddd;text-align:left;font-size:13px;", headerCell = cell + "background:#f5f5f5;font-weight:bold;";
+    var body = "<div style='font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#333;'>";
+    if (isTest) body += "<div style='background:#fff3cd;border:1px solid #ffc107;padding:12px;margin-bottom:16px;border-radius:4px;'><strong>TEST MODE</strong><br>In production this would go to: <strong>" + (roster.screeningMap[reviewerName].email || "(no email)") + "</strong></div>";
+    body += "<h2 style='color:#2c3e50;margin-bottom:4px;'>" + reviewerName + " — Report Card</h2><p style='color:#666;margin-top:0;'>" + period.label + " (" + cutoffLabel + ")</p>";
+    body += "<div style='background:#e3f0fc;padding:16px 20px;border-left:4px solid #3498db;margin:20px 0;border-radius:4px;'><div style='font-size:13px;color:#666;'>Total Fee</div><div style='font-size:24px;font-weight:bold;color:#27ae60;'>" + money_(cfg, fee) + "</div></div>";
+    body += "<table style='border-collapse:collapse;width:100%;'>";
+    body += "<tr><td style='" + headerCell + "'>Submitted</td><td style='" + cell + "'>" + submitted + "</td></tr>";
+    body += "<tr><td style='" + headerCell + "'>Interviewed</td><td style='" + cell + "font-weight:bold;'>" + interviewed + "</td></tr>";
+    body += "<tr><td style='" + headerCell + "'>Success Rate</td><td style='" + cell + "'>" + pct + "%</td></tr>";
+    body += "<tr><td style='" + headerCell + "'>Fee</td><td style='" + cell + "font-weight:bold;'>" + money_(cfg, fee) + "</td></tr>";
+    body += "<tr><td style='" + headerCell + "'>Passed</td><td style='" + cell + "color:#27ae60;'>" + passed + "</td></tr>";
+    body += "<tr><td style='" + headerCell + "'>Failed</td><td style='" + cell + "color:#dc3545;'>" + failed + "</td></tr></table>";
+    body += "<h3 style='margin-top:24px;color:#2c3e50;'>Interview Details (" + detail.length + ")</h3>";
+    if (detail.length === 0) body += "<p style='color:#888;font-style:italic;'>No interviews in this period.</p>";
+    else {
+      body += "<table style='border-collapse:collapse;width:100%;'><tr><th style='" + headerCell + "'>#</th><th style='" + headerCell + "'>Date</th><th style='" + headerCell + "'>Candidate</th><th style='" + headerCell + "'>Contact</th></tr>";
+      detail.forEach(function (c, i) { body += "<tr style='background:" + (i % 2 === 0 ? "#fff" : "#fafafa") + ";'><td style='" + cell + "'>" + (i + 1) + "</td><td style='" + cell + "'>" + c.date + "</td><td style='" + cell + "'><strong>" + c.name + "</strong></td><td style='" + cell + "'>" + c.phone + "</td></tr>"; });
+      body += "</table>";
+    }
+    body += "<p style='margin-top:24px;'>Questions or corrections: " + cfg.ADMIN_EMAIL + ".</p><p>Thank you for your work.</p><p><strong>People Team</strong></p></div>";
+
+    try {
+      sendEmailTo_(recipient, (isTest ? "[TEST] " : "") + "Report Card — " + period.label + " | " + reviewerName, body, cc);
+      results.push({ name: reviewerName, status: "Sent to " + recipient + " — " + interviewed + " interviews, " + money_(cfg, fee) }); sent++;
+    } catch (e) { results.push({ name: reviewerName, status: "Error: " + e.message }); }
+  });
+
+  var summary = sent + "/" + selected.length + " report(s) sent.\n\n";
+  results.forEach(function (r) { summary += r.name + ": " + r.status + "\n"; });
+  notifyAdmin_("Reviewer Report Cards" + (sendReal ? "" : " [TEST]"), cfg.ADMIN_EMAIL);
+  ui.alert("Reviewer Report Cards", summary, ui.ButtonSet.OK);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// STAGE-1 FOLLOW-UP RECAP  (per reviewer)
+// ════════════════════════════════════════════════════════════
+
+function sendStage1FollowUpRecap() {
+  var cfg = getConfig_();
+  var ui = SpreadsheetApp.getUi();
+
+  var roster = getRoster_();
+  var screeners = Object.keys(roster.screeningMap);
+  if (screeners.length === 0) { ui.alert("No active screening reviewers in the roster."); return; }
+
+  var list = "";
+  screeners.forEach(function (f, i) { list += (i + 1) + ". " + f + "\n"; });
+  var sel = ui.prompt("Select Reviewer", "Type a number, or 'all':\n\n" + list, ui.ButtonSet.OK_CANCEL);
+  if (sel.getSelectedButton() !== ui.Button.OK) return;
+  var input = sel.getResponseText().trim().toLowerCase();
+  var selected = [];
+  if (input === "all") selected = screeners;
+  else { var n = parseInt(input, 10); if (isNaN(n) || n < 1 || n > screeners.length) { ui.alert("Invalid selection."); return; } selected = [screeners[n - 1]]; }
+
+  var mode = ui.prompt("Recipient", "Type a full email to test, or 'send' to email each reviewer.", ui.ButtonSet.OK_CANCEL);
+  if (mode.getSelectedButton() !== ui.Button.OK) return;
+  var modeInput = mode.getResponseText().trim();
+  var sendReal = modeInput.toLowerCase() === "send";
+  var testEmail = sendReal ? "" : modeInput;
+  if (!sendReal && (testEmail === "" || testEmail.indexOf("@") === -1)) { ui.alert("Invalid email."); return; }
+
+  var period = payPeriodFromPrompt_(ui);
+  if (!period) return;
+
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var cc = cfg.CC_EMAILS || null;
+  var FYI = [STATUS.RESPONSE_LEGACY, "Withdraw", "No response / Ghosting"];
+  var sent = 0, results = [];
+
+  selected.forEach(function (reviewerName) {
+    var paid = [], fyi = [], paidCount = 0;
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i];
+      if (String(row[COLUMNS.REVIEWER - 1]).trim() !== reviewerName) continue;
+      var name = String(row[COLUMNS.NAME - 1]).trim(); if (name === "") continue;
+      var ts = row[COLUMNS.TIMESTAMP - 1]; if (!ts) continue;
+      var d = new Date(ts); if (isNaN(d.getTime()) || d < period.start || d > period.end) continue;
+
+      var status = String(row[COLUMNS.RESPONSE - 1]).trim();
+      var entry = { name: name, phone: String(row[COLUMNS.PHONE - 1]).trim(), source: String(row[COLUMNS.SOURCE - 1]).trim(),
+        verdict: String(row[COLUMNS.VERDICT - 1]).trim(), date: formatTimestamp_(ts) };
+      if (status === STATUS.RESPONSE_PROCEED) { paid.push(entry); paidCount++; }
+      else if (FYI.indexOf(status) !== -1) { entry.reason = status; fyi.push(entry); }
+    }
+    var fee = paidCount * cfg.PAY_RATE;
+    var recipient = sendReal ? (roster.screeningMap[reviewerName].email || "") : testEmail;
+    if (recipient === "" || recipient.indexOf("@") === -1) { results.push({ name: reviewerName, status: "Skipped — no email" }); return; }
+
+    var isTest = !sendReal;
+    var cell = "padding:8px 12px;border:1px solid #ddd;text-align:left;font-size:13px;", headerCell = cell + "background:#f5f5f5;font-weight:bold;";
+    var body = "<div style='font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#333;'>";
+    if (isTest) body += "<div style='background:#fff3cd;border:1px solid #ffc107;padding:12px;margin-bottom:16px;border-radius:4px;'><strong>TEST MODE</strong><br>Production recipient: <strong>" + (roster.screeningMap[reviewerName].email || "(no email)") + "</strong></div>";
+    body += "<h2 style='color:#2c3e50;margin-bottom:4px;'>Screening Follow-up Recap</h2><p>Dear <strong>" + reviewerName + "</strong>,</p>";
+    body += "<p>Summary of your screening interviews for this period.</p>";
+    body += "<div style='background:#e3f0fc;padding:16px 20px;border-left:4px solid #3498db;margin:20px 0;border-radius:4px;'><div style='font-size:13px;color:#666;'>Paid interviews: <strong>" + paidCount + "</strong></div><div style='font-size:20px;font-weight:bold;color:#27ae60;margin-top:8px;'>Estimated Fee: " + money_(cfg, fee) + "</div></div>";
+
+    body += "<h3 style='color:#27ae60;margin-top:24px;'>Paid Interviews (" + paid.length + ")</h3>";
+    if (paid.length === 0) body += "<p style='color:#888;font-style:italic;'>None yet.</p>";
+    else {
+      body += "<table style='border-collapse:collapse;width:100%;'><tr><th style='" + headerCell + "'>#</th><th style='" + headerCell + "'>Name</th><th style='" + headerCell + "'>Contact</th><th style='" + headerCell + "'>Source</th><th style='" + headerCell + "'>Verdict</th><th style='" + headerCell + "'>Date</th></tr>";
+      paid.forEach(function (c, i) { body += "<tr style='background:" + (i % 2 === 0 ? "#fff" : "#fafafa") + ";'><td style='" + cell + "'>" + (i + 1) + "</td><td style='" + cell + "'><strong>" + c.name + "</strong></td><td style='" + cell + "'>" + c.phone + "</td><td style='" + cell + "'>" + c.source + "</td><td style='" + cell + "'>" + c.verdict + "</td><td style='" + cell + "'>" + c.date + "</td></tr>"; });
+      body += "</table>";
+    }
+
+    body += "<h3 style='color:#888;margin-top:24px;'>FYI — Not Counted (" + fyi.length + ")</h3>";
+    if (fyi.length === 0) body += "<p style='color:#888;font-style:italic;'>None.</p>";
+    else {
+      body += "<p style='color:#666;font-size:13px;'>Shown for transparency; not counted toward fee.</p><table style='border-collapse:collapse;width:100%;'><tr><th style='" + headerCell + "'>#</th><th style='" + headerCell + "'>Name</th><th style='" + headerCell + "'>Contact</th><th style='" + headerCell + "'>Status</th><th style='" + headerCell + "'>Date</th></tr>";
+      fyi.forEach(function (c, i) { body += "<tr style='background:" + (i % 2 === 0 ? "#fff" : "#fafafa") + ";'><td style='" + cell + "'>" + (i + 1) + "</td><td style='" + cell + "'>" + c.name + "</td><td style='" + cell + "'>" + c.phone + "</td><td style='" + cell + "'>" + c.reason + "</td><td style='" + cell + "'>" + c.date + "</td></tr>"; });
+      body += "</table>";
+    }
+    body += "<p style='margin-top:24px;'>Questions or corrections: " + cfg.ADMIN_EMAIL + ".</p><p>Thank you.</p><p><strong>People Team</strong></p></div>";
+
+    try {
+      sendEmailTo_(recipient, (isTest ? "[TEST] " : "") + "Follow-up Recap — " + getCurrentDate_(), body, cc);
+      results.push({ name: reviewerName, status: "Sent to " + recipient + " (Paid:" + paidCount + " FYI:" + fyi.length + " Fee:" + money_(cfg, fee) + ")" }); sent++;
+    } catch (e) { results.push({ name: reviewerName, status: "Error: " + e.message }); }
+  });
+
+  var summary = sent + "/" + selected.length + " recap(s) sent.\n\n";
+  results.forEach(function (r) { summary += r.name + ": " + r.status + "\n"; });
+  notifyAdmin_("Stage-1 Follow-up Recap" + (sendReal ? "" : " [TEST]"), cfg.ADMIN_EMAIL);
+  ui.alert("Stage-1 Follow-up Recap", summary, ui.ButtonSet.OK);
+}
+
+
+// ════════════════════════════════════════════════════════════
+// DASHBOARD (HTML modal)
+// ════════════════════════════════════════════════════════════
+
+function openDashboard() {
+  var cfg = getConfig_();
+  var data = getSheetData_(cfg.SHEET_APPLICANTS);
+  var buckets = computeBuckets_(cfg, data);
+
+  // Scans reuse.
+  var queueMap = buildQueueMap_(cfg);
+  var pendingAssessment = [], readyInterview = [], readyOffering = [];
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var name = String(row[COLUMNS.NAME - 1]).trim(); if (name === "") continue;
+    var verdict = String(row[COLUMNS.VERDICT - 1]).trim(), verdictL = verdict.toLowerCase();
+    var assess = String(row[COLUMNS.ASSESSMENT - 1]).trim(), assessL = assess.toLowerCase();
+    var mgrAttend = String(row[COLUMNS.MGR_ATTEND - 1]).trim(), mgrStatus = String(row[COLUMNS.MGR_STATUS - 1]).trim();
+    var phone = String(row[COLUMNS.PHONE - 1]).trim(), reviewer = String(row[COLUMNS.REVIEWER - 1]).trim();
+    var toOffers = String(row[COLUMNS.TO_OFFERS - 1]).trim();
+    var offerResult = String(row[COLUMNS.OFFER_RESULT - 1]).trim(), offerNotes = String(row[COLUMNS.OFFER_NOTES - 1]).trim();
+
+    if (verdict.toLowerCase().indexOf(STATUS.VERDICT_PASS_TOKEN) !== -1 && assess === STATUS.ASSESS_NOT_DONE)
+      pendingAssessment.push({ name: name, reviewer: reviewer, phone: phone });
+
+    var attendBlank = mgrAttend === "" || mgrAttend === "-", statusBlank = mgrStatus === "" || mgrStatus === "-";
+    if (verdictL.indexOf(STATUS.VERDICT_PASS_TOKEN) !== -1 && STATUS.ASSESS_PASS.indexOf(assessL) !== -1 && attendBlank && statusBlank) {
+      var qe = queueMap[norm_(name)];
+      if (!(qe && qe.processed === "Done")) readyInterview.push({ name: name, reviewer: reviewer, phone: phone, assignedTo: (qe && qe.assignee !== "") ? qe.assignee : "⚠ Unassigned" });
+    }
+    if (STATUS.STAGE2_PASS_STATUSES.indexOf(mgrStatus) !== -1 && offerResult === "" && offerNotes === "")
+      readyOffering.push({ name: name, reviewer: reviewer, phone: phone, status: mgrStatus, notified: toOffers === "" ? "Not yet" : "Notified" });
+  }
+
+  var weeks = buildWeekly_(cfg, data);
+
+  var css = "body{font-family:Arial,sans-serif;margin:0;background:#f4f6f8;}.header{background:#2c3e50;color:#fff;padding:16px 24px;}.header h1{margin:0;font-size:20px;}.header p{margin:4px 0 0;font-size:12px;opacity:.8;}.tabs{display:flex;background:#34495e;padding:0 16px;overflow-x:auto;}.tab{padding:12px 20px;color:#bdc3c7;cursor:pointer;border-bottom:3px solid transparent;white-space:nowrap;font-size:13px;}.tab:hover{background:#2c3e50;color:#fff;}.tab.active{color:#fff;border-bottom-color:#3498db;background:#2c3e50;}.content{padding:20px 24px;}.panel{display:none;}.panel.active{display:block;}h2{margin:0 0 12px;font-size:18px;color:#2c3e50;}h3{margin:20px 0 8px;font-size:14px;color:#34495e;}table{border-collapse:collapse;margin-top:8px;font-size:13px;background:#fff;}th,td{padding:6px 10px;border:1px solid #ddd;text-align:left;}th{background:#ecf0f1;font-weight:bold;}tr:nth-child(even) td{background:#fafafa;}.funnel-cell{text-align:center;}.conv{color:#27ae60;font-size:11px;}.drop{font-size:11px;}.drop.warn{color:#e67e22;font-weight:bold;}.drop.bad{color:#dc3545;font-weight:bold;}.stat-card{background:#fff;padding:12px 16px;border-left:4px solid #3498db;margin-top:8px;}.empty{color:#888;font-style:italic;padding:12px;}.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:bold;margin-left:8px;}.badge-green{background:#d4edda;color:#155724;}.badge-yellow{background:#fff3cd;color:#856404;}.badge-red{background:#f8d7da;color:#721c24;}.group-header{background:#e3f0fc;padding:8px 12px;margin-top:16px;font-weight:bold;border-left:4px solid #3498db;}";
+
+  var html = "<!DOCTYPE html><html><head><style>" + css + "</style></head><body>";
+  html += "<div class='header'><h1>Recruiter Dashboard</h1><p>Snapshot as of " + getCurrentTime_() + "</p></div>";
+  html += "<div class='tabs'><div class='tab active' onclick=\"showTab(event,'pipeline')\">Pipeline</div><div class='tab' onclick=\"showTab(event,'assess')\">Pending Assessment (" + pendingAssessment.length + ")</div><div class='tab' onclick=\"showTab(event,'interview')\">Ready for Interview (" + readyInterview.length + ")</div><div class='tab' onclick=\"showTab(event,'offering')\">Ready for Offering (" + readyOffering.length + ")</div><div class='tab' onclick=\"showTab(event,'health')\">Health</div></div><div class='content'>";
+
+  // Pipeline
+  html += "<div id='pipeline' class='panel active'><h2>Recruitment Pipeline</h2><p style='color:#666;font-size:12px;'>Cumulative, excluding legacy rows.</p>";
+  html += "<h3>By Role</h3>" + buildDashFunnel_([
+    { label: "General", counts: buckets.roleGeneral, color: "#e3f0fc" },
+    { label: ROLE.CERTIFIED, counts: buckets.roleCertified, color: "#d4edda" },
+    { label: "TOTAL", counts: buckets.total, color: "#fff3cd" },
+  ]);
+  html += "<h3>By Channel</h3>" + buildDashFunnel_([
+    { label: "Channel A", counts: buckets.channelA, color: "#e8daef" },
+    { label: "Channel B", counts: buckets.channelB, color: "#fadbd8" },
+  ]) + "</div>";
+
+  html += buildDashScanPanel_("assess", "Pending Assessment", pendingAssessment, "reviewer", ["name", "phone"], ["Name", "Contact"]);
+  html += buildDashScanPanel_("interview", "Ready for Interview", readyInterview, "assignedTo", ["name", "phone", "reviewer"], ["Name", "Contact", "Reviewer"]);
+  html += buildDashScanPanel_("offering", "Ready for Offering", readyOffering, null, ["name", "phone", "reviewer", "status", "notified"], ["Name", "Contact", "Reviewer", "Stage-2 Status", "Notified"]);
+
+  // Health
+  html += "<div id='health' class='panel'><h2>Interview Health Check-up</h2>";
+  if (weeks.length < 2) html += "<div class='empty'>Not enough weekly data yet.</div>";
+  else {
+    var curKey = weekKeyOf_(new Date());
+    var completed = weeks.filter(function (w, idx) { return w.key !== curKey && idx !== 0; });
+    var bestW = completed[0], worstW = completed[0], tc = 0, ti = 0;
+    completed.forEach(function (w) { if (w.candidates > bestW.candidates) bestW = w; if (w.candidates < worstW.candidates) worstW = w; tc += w.candidates; ti += w.reviewerCount; });
+    var lastW = completed[completed.length - 1];
+    var st = classifyWeek_(lastW.candidates, lastW.reviewerCount, lastW.reviewerCount > 0 ? lastW.candidates / lastW.reviewerCount : 0);
+    html += "<div style='background:" + st.color + ";color:#fff;padding:14px 18px;border-radius:4px;margin:12px 0;'><strong style='font-size:16px;'>" + st.label.toUpperCase() + "</strong><br><span style='font-size:13px;'>Last week: " + lastW.candidates + " interviews by " + lastW.reviewerCount + " reviewer(s)</span></div>";
+    html += "<div class='stat-card'><strong>Avg candidates/week:</strong> " + (tc / completed.length).toFixed(1) + "</div>";
+    html += "<div class='stat-card' style='border-color:#27ae60;'><strong>Best week:</strong> " + Utilities.formatDate(bestW.start, Session.getScriptTimeZone(), "dd MMM yyyy") + " — " + bestW.candidates + "</div>";
+    html += "<div class='stat-card' style='border-color:#dc3545;'><strong>Worst week:</strong> " + Utilities.formatDate(worstW.start, Session.getScriptTimeZone(), "dd MMM yyyy") + " — " + worstW.candidates + "</div>";
+    html += "<h3>Week-by-Week</h3><table><tr><th>Week</th><th>Candidates</th><th>Reviewers</th><th>Avg</th><th>Status</th></tr>";
+    weeks.forEach(function (w, idx) {
+      var ap = w.reviewerCount > 0 ? w.candidates / w.reviewerCount : 0, sl, sc;
+      if (w.key === curKey) { sl = "In Progress"; sc = "#888"; }
+      else if (idx === 0) { sl = "Ramp-up"; sc = "#888"; }
+      else { var c = classifyWeek_(w.candidates, w.reviewerCount, ap); sl = c.label; sc = c.color; }
+      html += "<tr><td>" + Utilities.formatDate(w.start, Session.getScriptTimeZone(), "dd MMM yyyy") + "</td><td><strong>" + w.candidates + "</strong></td><td>" + w.reviewerCount + "</td><td>" + ap.toFixed(1) + "</td><td style='color:" + sc + ";font-weight:bold;'>" + sl + "</td></tr>";
+    });
+    html += "</table>";
+  }
+  html += "</div>";
+
+  html += "</div><script>function showTab(e,id){var p=document.querySelectorAll('.panel'),t=document.querySelectorAll('.tab');for(var i=0;i<p.length;i++)p[i].classList.remove('active');for(var j=0;j<t.length;j++)t[j].classList.remove('active');document.getElementById(id).classList.add('active');e.currentTarget.classList.add('active');}</script></body></html>";
+
+  var out = HtmlService.createHtmlOutput(html).setWidth(1200).setHeight(750).setTitle("Recruiter Dashboard");
+  SpreadsheetApp.getUi().showModelessDialog(out, "Recruiter Dashboard");
+}
+
+function buildDashScanPanel_(id, title, rows, groupKey, cols, headers) {
+  var html = "<div id='" + id + "' class='panel'><h2>" + title + " <span class='badge badge-yellow'>" + rows.length + "</span></h2>";
+  if (rows.length === 0) return html + "<div class='empty'>Nothing here.</div></div>";
+
+  function tableFor(list) {
+    var t = "<table><tr><th>#</th>";
+    headers.forEach(function (h) { t += "<th>" + h + "</th>"; });
+    t += "</tr>";
+    list.forEach(function (r, i) {
+      t += "<tr><td>" + (i + 1) + "</td>";
+      cols.forEach(function (c) { t += "<td>" + (r[c] || "") + "</td>"; });
+      t += "</tr>";
+    });
+    return t + "</table>";
+  }
+
+  if (groupKey) {
+    var grouped = groupBy_(rows, groupKey);
+    for (var g in grouped) { if (!grouped.hasOwnProperty(g)) continue; html += "<div class='group-header'>" + g + " (" + grouped[g].length + ")</div>" + tableFor(grouped[g]); }
+  } else {
+    html += tableFor(rows);
+  }
+  return html + "</div>";
+}
+
+function buildDashFunnel_(sections) {
+  var short = [
+    { key: "applicant", label: "Applicant" }, { key: "responded", label: "Responded" },
+    { key: "passedScreening", label: "Pass Screen" }, { key: "assessDone", label: "Assess Done" },
+    { key: "assessPassed", label: "Assess Pass" }, { key: "sentStage2", label: "Sent S2" },
+    { key: "stage2Passed", label: "S2 Pass" }, { key: "offered", label: "Offered" }, { key: "accepted", label: "Accepted" },
+  ];
+  var html = "<table><tr><th></th>";
+  short.forEach(function (s) { html += "<th>" + s.label + "</th>"; });
+  html += "</tr>";
+  sections.forEach(function (section) {
+    var counts = section.counts;
+    html += "<tr><td style='background:" + section.color + ";font-weight:bold;' rowspan='3'>" + section.label + "</td>";
+    short.forEach(function (s) { html += "<td class='funnel-cell'><strong>" + (counts[s.key] || 0) + "</strong></td>"; });
+    html += "</tr><tr>";
+    short.forEach(function (s, i) {
+      if (i === 0) { html += "<td class='funnel-cell'>—</td>"; return; }
+      var prev = counts[short[i - 1].key] || 0, curr = counts[s.key] || 0;
+      html += "<td class='funnel-cell conv'>↑ " + (prev === 0 ? "N/A" : ((curr / prev) * 100).toFixed(1) + "%") + "</td>";
+    });
+    html += "</tr><tr>";
+    short.forEach(function (s, i) {
+      if (i === 0) { html += "<td class='funnel-cell'>—</td>"; return; }
+      var prev = counts[short[i - 1].key] || 0, curr = counts[s.key] || 0;
+      if (prev === 0) { html += "<td class='funnel-cell'>N/A</td>"; return; }
+      var dv = ((prev - curr) / prev) * 100, cls = "drop";
+      if (dv > 50) cls = "drop bad"; else if (dv > 30) cls = "drop warn";
+      html += "<td class='funnel-cell " + cls + "'>↓ " + dv.toFixed(1) + "%</td>";
+    });
+    html += "</tr>";
+  });
+  return html + "</table>";
+}
